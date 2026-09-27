@@ -18,7 +18,7 @@
  * request and/or as environment variables):
  *   base_url     default http://workbench:8080
  *   tool_path    default /api/tool/call
- *   timeout_secs default 60
+ *   timeout_secs default 0 (NO timeout; a positive value opts in)
  *   auth_header  optional Authorization header value (empty = header omitted)
  *
  * Runtime: Node >= 18 (global `fetch` + `AbortController`), no npm deps.
@@ -33,7 +33,17 @@ const SERVER_VERSION = "0.1.0";
 
 const DEFAULT_BASE_URL = "http://workbench:8080";
 const DEFAULT_TOOL_PATH = "/api/tool/call";
-const DEFAULT_TIMEOUT_SECS = 60;
+// Timeout semantics for `timeout_secs`:
+//   absent / empty / 0 -> NO timeout: the request runs until the workbench
+//                         answers, the connection fails, or the CLIENT cancels
+//                         it (omniagent `core__cancel_task` drops the in-flight
+//                         MCP call and sends `notifications/cancelled`, which
+//                         aborts the HTTP request here). Workbench dispatches
+//                         are legitimately long-running: a hidden clock must
+//                         never kill them.
+//   positive integer   -> explicit operator opt-in timeout in seconds.
+const NO_TIMEOUT_SECS = 0;
+const DEFAULT_TIMEOUT_SECS = NO_TIMEOUT_SECS;
 
 // The single declared tool name. `tool_qualify("workbench", "tool")` in core
 // turns it into the exposed name `workbench__tool`.
@@ -63,6 +73,26 @@ function pickInt(candidates, fallback) {
   return fallback;
 }
 
+// Timeout parser: absent/empty falls back, `0` means NO timeout (an explicit
+// opt-out), any positive integer is the timeout in seconds.
+function pickTimeoutSecs(candidates, fallback) {
+  for (const value of candidates) {
+    if (value === undefined || value === null) continue;
+    const text = String(value).trim();
+    if (text === "") continue;
+    const parsed = Number.parseInt(text, 10);
+    if (!Number.isFinite(parsed)) continue;
+    if (parsed <= 0) return NO_TIMEOUT_SECS;
+    return parsed;
+  }
+  return fallback;
+}
+
+/** Human-readable timeout for the logs: "none" when no timeout is set. */
+function describeTimeout() {
+  return config.timeout_secs > 0 ? String(config.timeout_secs) : "none";
+}
+
 const config = {
   base_url: pickString(
     [process.env.base_url, process.env.BASE_URL, process.env.WORKBENCH_BASE_URL],
@@ -72,7 +102,7 @@ const config = {
     [process.env.tool_path, process.env.TOOL_PATH, process.env.WORKBENCH_TOOL_PATH],
     DEFAULT_TOOL_PATH
   ),
-  timeout_secs: pickInt(
+  timeout_secs: pickTimeoutSecs(
     [
       process.env.timeout_secs,
       process.env.TIMEOUT_SECS,
@@ -98,7 +128,10 @@ function applyConfig(payload) {
   if (payload.tool_path !== undefined)
     config.tool_path = pickString([payload.tool_path], config.tool_path);
   if (payload.timeout_secs !== undefined)
-    config.timeout_secs = pickInt([payload.timeout_secs], config.timeout_secs);
+    config.timeout_secs = pickTimeoutSecs(
+      [payload.timeout_secs],
+      config.timeout_secs
+    );
   if (payload.auth_header !== undefined)
     config.auth_header = pickString([payload.auth_header], "");
   console.error(
@@ -107,7 +140,7 @@ function applyConfig(payload) {
       " tool_path=" +
       config.tool_path +
       " timeout_secs=" +
-      config.timeout_secs +
+      describeTimeout() +
       " auth_header=" +
       (config.auth_header ? "<set>" : "<none>")
   );
@@ -190,7 +223,12 @@ function targetUrl() {
   return base + (path.startsWith("/") ? path : "/" + path);
 }
 
-async function callWorkbench(toolName, params) {
+// In-flight tools/call requests: JSON-RPC request id -> AbortController, so a
+// `notifications/cancelled` from the client tears the HTTP request down for
+// real (core__cancel_task must abort the in-flight call, not just flag it).
+const inFlight = new Map();
+
+async function callWorkbench(toolName, params, controller) {
   const url = targetUrl();
   const headers = {
     "Content-Type": "application/json",
@@ -199,11 +237,14 @@ async function callWorkbench(toolName, params) {
   if (config.auth_header) headers.Authorization = config.auth_header;
 
   const body = JSON.stringify({ tool: toolName, params: params });
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    Math.max(1, config.timeout_secs) * 1000
-  );
+  const abort = controller || new AbortController();
+  const timeout_secs = config.timeout_secs;
+  // NO timeout configured -> no timer at all: the request ends when the
+  // workbench answers, the connection fails, or the client cancels it.
+  const timer =
+    timeout_secs > 0
+      ? setTimeout(() => abort.abort(), timeout_secs * 1000)
+      : null;
 
   console.error("[workbench] POST " + url + " body=" + body);
 
@@ -213,13 +254,15 @@ async function callWorkbench(toolName, params) {
       method: "POST",
       headers,
       body,
-      signal: controller.signal,
+      signal: abort.signal,
     });
   } catch (err) {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
     const aborted = err && err.name === "AbortError";
     const reason = aborted
-      ? "request timed out after " + config.timeout_secs + "s"
+      ? timeout_secs > 0
+        ? "request timed out after " + timeout_secs + "s"
+        : "request cancelled by the client"
       : (err && err.message) || String(err);
     console.error("[workbench] request failed: " + reason);
     return {
@@ -227,7 +270,7 @@ async function callWorkbench(toolName, params) {
       text: "workbench request to " + url + " failed: " + reason,
     };
   }
-  clearTimeout(timer);
+  if (timer) clearTimeout(timer);
 
   let bodyText = "";
   try {
@@ -301,9 +344,21 @@ async function handleCall(reqId, params) {
   }
 
   // NOT awaited by the readline loop: calls are concurrent (150 parallel
-  // calls must all be in flight without blocking each other).
-  const outcome = await callWorkbench(workbenchTool, workbenchParams);
-  sendJson(makeSuccess(reqId, toolResult(outcome.text, outcome.isError)));
+  // calls must all be in flight without blocking each other) - which is also
+  // what lets a `notifications/cancelled` be processed WHILE this call awaits
+  // the HTTP response.
+  const controller = new AbortController();
+  inFlight.set(reqId, controller);
+  try {
+    const outcome = await callWorkbench(
+      workbenchTool,
+      workbenchParams,
+      controller
+    );
+    sendJson(makeSuccess(reqId, toolResult(outcome.text, outcome.isError)));
+  } finally {
+    inFlight.delete(reqId);
+  }
 }
 
 // ── Main loop ──────────────────────────────────────────────────────────────
@@ -320,7 +375,7 @@ function applyConfigFromEnvSummary() {
       " tool_path=" +
       config.tool_path +
       " timeout_secs=" +
-      config.timeout_secs +
+      describeTimeout() +
       " auth_header=" +
       (config.auth_header ? "<set>" : "<none>")
   );
@@ -368,6 +423,27 @@ rl.on("line", function (line) {
       return;
     }
     if (reqId !== undefined && reqId !== null) handleToolsList(reqId);
+  } else if (method === "notifications/cancelled") {
+    // The client aborted an in-flight request (omniagent core__cancel_task
+    // dropped the MCP call): abort the matching HTTP request so it is torn
+    // down for real instead of running on unnoticed.
+    const cancelId =
+      params && params.requestId !== undefined ? params.requestId : undefined;
+    const controller =
+      cancelId !== undefined ? inFlight.get(cancelId) : undefined;
+    if (controller) {
+      inFlight.delete(cancelId);
+      controller.abort();
+      console.error(
+        "[workbench] notifications/cancelled: aborted in-flight request " +
+          cancelId
+      );
+    } else {
+      console.error(
+        "[workbench] notifications/cancelled: no in-flight request " +
+          (cancelId === undefined ? "(missing requestId)" : cancelId)
+      );
+    }
   } else if (method === "tools/call") {
     if (!initialized) {
       if (reqId !== undefined && reqId !== null)
@@ -393,5 +469,11 @@ rl.on("line", function (line) {
 
 rl.on("close", function () {
   console.error("[workbench] MCP server shutting down (stdin closed)");
+  // Abort anything still in flight: stdin closed = the client is gone, no
+  // consumer is left for the response.
+  for (const controller of inFlight.values()) {
+    controller.abort();
+  }
+  inFlight.clear();
   process.exit(0);
 });
