@@ -21,6 +21,10 @@ const path = require("path");
 const { spawn } = require("child_process");
 
 const PLUGIN_DIR = path.join(__dirname, "..");
+// The plugin is exposed as `{dirname}__tool` (workbench__tool /
+// workstation__tool) and reports that same name as its serverInfo name, so the
+// harness derives it from its own directory instead of hardcoding it.
+const PLUGIN_NAME = path.basename(PLUGIN_DIR);
 const results = [];
 let failures = 0;
 
@@ -36,11 +40,20 @@ function check(name, cond, detail) {
 
 const stubRequests = [];
 let hangMode = false;
+let slowMs = 1800; // /slow delays its response by this much (no-timeout gates)
+let stubAborted = false; // a client tore an in-flight request down (timeout/cancel)
 
 function startStub() {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       const chunks = [];
+      res.on("error", () => {}); // the client may disappear (timeout/cancel)
+      req.on("aborted", () => {
+        stubAborted = true;
+      });
+      res.on("close", () => {
+        if (!res.writableEnded) stubAborted = true;
+      });
       req.on("data", (c) => chunks.push(c));
       req.on("end", () => {
         const raw = Buffer.concat(chunks).toString("utf8");
@@ -59,6 +72,17 @@ function startStub() {
         if (req.url === "/boom") {
           res.writeHead(500, { "content-type": "text/plain" });
           res.end("boom");
+          return;
+        }
+        if (req.url === "/slow") {
+          setTimeout(() => {
+            try {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: true, slow: true }));
+            } catch (e) {
+              /* the client is gone (timeout/cancel) */
+            }
+          }, slowMs);
           return;
         }
         if (req.url === "/badjson") {
@@ -163,7 +187,7 @@ async function main() {
   const list = await client.call("tools/list", {});
   rawExchange.push({ "tools/list": list });
   console.log("RAW tools/list: " + JSON.stringify(list));
-  check("initialize -> serverInfo.name === workbench", init.serverInfo && init.serverInfo.name === "workbench", JSON.stringify(init.serverInfo));
+  check("initialize -> serverInfo.name === " + PLUGIN_NAME, init.serverInfo && init.serverInfo.name === PLUGIN_NAME, JSON.stringify(init.serverInfo));
   check("tools/list returns EXACTLY one tool", Array.isArray(list.tools) && list.tools.length === 1, "count=" + (list.tools || []).length);
   const tool = (list.tools || [])[0] || {};
   check("tool name === 'tool' (exposed as workbench__tool)", tool.name === "tool", "name=" + tool.name);
@@ -192,10 +216,10 @@ async function main() {
   await client.call("tools/call", { name: "tool", arguments: { tool: "t", params: { a: 1, b: [1, 2], c: { d: "e" } } } });
   check("params passed through untouched", stubRequests[0] && stubRequests[0].raw === '{"tool":"t","params":{"a":1,"b":[1,2],"c":{"d":"e"}}}', stubRequests[0] && stubRequests[0].raw);
 
-  // qualified name also accepted (workbench__tool)
+  // qualified name also accepted (PLUGIN_NAME__tool)
   stubRequests.length = 0;
-  const qualified = await client.call("tools/call", { name: "workbench__tool", arguments: { tool: "q", params: {} } });
-  check("qualified name workbench__tool accepted", !qualified.isError && stubRequests.length === 1, "isError=" + qualified.isError);
+  const qualified = await client.call("tools/call", { name: PLUGIN_NAME + "__tool", arguments: { tool: "q", params: {} } });
+  check("qualified name " + PLUGIN_NAME + "__tool accepted", !qualified.isError && stubRequests.length === 1, "isError=" + qualified.isError);
 
   // Gate 4a: non-2xx
   await client.call("configure", { tool_path: "/nope" });
@@ -221,6 +245,77 @@ async function main() {
   const elapsed = Date.now() - t0;
   hangMode = false;
   check("timeout -> isError true, no hang", timedOut.isError === true && elapsed < 10000, `elapsed=${elapsed}ms text=${JSON.stringify(timedOut.content[0].text).slice(0, 160)}`);
+
+  // Gate 4c-2: `timeout_secs` absent / 0 = NO timeout (the workstation tool is
+  // long-running by design): the SAME slow endpoint that a 1s timeout kills
+  // must complete when no timeout is configured, and the plugin must report the
+  // effective mode as `none`.
+  await client.call("configure", { base_url: base, tool_path: "/slow", timeout_secs: 0 });
+  const slowStart = Date.now();
+  const slowOk = await client.call("tools/call", { name: "tool", arguments: { tool: "hello_world", params: {} } });
+  const slowElapsed = Date.now() - slowStart;
+  check(
+    "timeout_secs=0 -> slow call completes (no timer armed)",
+    !slowOk.isError && slowElapsed >= slowMs && /slow/.test(slowOk.content[0].text),
+    `elapsed=${slowElapsed}ms text=${JSON.stringify(slowOk.content[0].text).slice(0, 120)}`
+  );
+  check(
+    "timeout_secs=0 -> plugin reports effective mode 'none'",
+    /timeout_secs=none/.test(client.stderr),
+    client.stderr.split("\n").filter((l) => l.indexOf("timeout_secs") >= 0).slice(-1).join("")
+  );
+  // a positive value stays backwards compatible: 1s kills the same slow call
+  await client.call("configure", { tool_path: "/slow", timeout_secs: 1 });
+  const slowKilled = await client.call("tools/call", { name: "tool", arguments: { tool: "hello_world", params: {} } });
+  check(
+    "timeout_secs=1 -> the same slow call is still killed",
+    slowKilled.isError === true && /timed out after 1s/.test(slowKilled.content[0].text),
+    JSON.stringify(slowKilled.content[0].text).slice(0, 140)
+  );
+
+  // Gate 4c-3: no timeout_secs anywhere (env + config absent) -> no timer either
+  const clientNoTimeout = startServer({ base_url: base, tool_path: "/slow" });
+  await clientNoTimeout.call("initialize", {
+    protocolVersion: "2025-03-26",
+    capabilities: {},
+    clientInfo: { name: "tester", version: "1.0.0" },
+  });
+  clientNoTimeout.notify("notifications/initialized", {});
+  const noTimeoutStart = Date.now();
+  const noTimeoutCall = await clientNoTimeout.call("tools/call", { name: "tool", arguments: { tool: "hello_world", params: {} } });
+  const noTimeoutElapsed = Date.now() - noTimeoutStart;
+  check(
+    "no timeout_secs configured -> slow call completes (default is no timer)",
+    !noTimeoutCall.isError && noTimeoutElapsed >= slowMs,
+    `elapsed=${noTimeoutElapsed}ms text=${JSON.stringify(noTimeoutCall.content[0].text).slice(0, 120)}`
+  );
+  clientNoTimeout.stop();
+
+  // Gate 4c-4: `notifications/cancelled` tears the in-flight HTTP request down
+  // for real (this is the path core__cancel_task drives): the stub must observe
+  // the connection closing, and the call must answer a cancelled error instead
+  // of hanging the turn.
+  await client.call("configure", { base_url: base, tool_path: "/hang", timeout_secs: 0 });
+  hangMode = true;
+  stubAborted = false;
+  const cancelledCall = client.call("tools/call", { name: "tool", arguments: { tool: "hello_world", params: {} } });
+  const cancelledId = client.seq; // client.call assigns the id synchronously
+  await new Promise((r) => setTimeout(r, 200));
+  client.notify("notifications/cancelled", { requestId: cancelledId, reason: "tester cancel" });
+  const cancelResult = await Promise.race([
+    cancelledCall,
+    new Promise((r) => setTimeout(() => r({ isError: true, content: [{ type: "text", text: "NO ANSWER within 5s" }] }), 5000)),
+  ]);
+  await new Promise((r) => setTimeout(r, 100));
+  hangMode = false;
+  check("notifications/cancelled -> in-flight HTTP request torn down at the server", stubAborted === true, "stubAborted=" + stubAborted);
+  check(
+    "notifications/cancelled -> call answers an explicit cancelled error (never hangs)",
+    cancelResult.isError === true && /cancel/i.test(cancelResult.content[0].text),
+    JSON.stringify(cancelResult.content[0].text).slice(0, 140)
+  );
+  const aliveAfterCancel = await client.call("tools/list", {});
+  check("server alive after a cancelled call", !!(aliveAfterCancel.tools && aliveAfterCancel.tools.length === 1));
 
   // Gate 4d: invalid args -> JSON-RPC -32602
   await client.call("configure", { tool_path: "/echo", timeout_secs: 5 });
@@ -259,7 +354,7 @@ async function main() {
   console.log("\n=== RAW JSON-RPC EXCHANGE (gate 1) ===");
   console.log(JSON.stringify(rawExchange, null, 2));
   console.log(`\nRESULT: ${results.length - failures}/${results.length} PASS`);
-  console.log(failures === 0 ? "WORKBENCH_PLUGIN_TEST: ALL PASS" : `WORKBENCH_PLUGIN_TEST: ${failures} FAILED`);
+  console.log(failures === 0 ? PLUGIN_NAME.toUpperCase() + "_PLUGIN_TEST: ALL PASS" : PLUGIN_NAME.toUpperCase() + `_PLUGIN_TEST: ${failures} FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }
 
