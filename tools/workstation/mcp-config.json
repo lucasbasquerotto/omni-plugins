@@ -1,7 +1,7 @@
 {
   "servers": [
     {
-      "name": "workbench",
+      "name": "workstation",
       "transport": "stdio",
       "command": "nodejs",
       "args": ["server.js"],
