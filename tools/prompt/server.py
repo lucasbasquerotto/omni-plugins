@@ -316,12 +316,17 @@ TOOL_GUIDANCE = (
     "thread - a second read returns a '[duplicate read ...]' marker, not content. "
     "Trust the injected '=== Context Compacted ===' summary and your notes instead; "
     "re-reading dumps is a forbidden anti-loop that wastes iterations.\n"
-    "13. SUBTASKS: after planning a multi-step task, create one subtask per plan step "
-    "with the subtasks tool (subtasks__manage_subtasks, action=\"add\"); as you finish "
-    "each step mark its subtask completed (action=\"update\", subtask_id=N, "
-    "status=\"completed\"); cancel any subtask that is no longer needed "
-    "(status=\"cancelled\"); before your final answer, complete or cancel ALL subtasks "
-    "so none remain pending.\n"
+    "13. SUBTASKS: the thread's subtasks are listed in the '## Subtasks' block of "
+    "your context WITH their ids ([#<id>]). In plan mode the engine has ALREADY "
+    "created one subtask per parsed plan step: REUSE those rows - mark the one you "
+    "are CURRENTLY working on as processing (action=\"update\", subtask_id=<id>, "
+    "status=\"processing\"), mark each finished step completed (action=\"update\", "
+    "subtask_id=<id>, status=\"completed\") and cancel rows that are no longer "
+    "needed (status=\"cancelled\"). Do NOT create a second set for the plan; call "
+    "action=\"add\" only for steps discovered MID-RUN, in the order you will execute "
+    "them. At least one subtask processing at a time, more allowed for "
+    "interdependent subtasks. Before your final answer, complete or cancel ALL "
+    "subtasks so none remain pending.\n"
     "14. NO-REPETITION + VERIFY-ONCE + NO-PROGRESS STOP: never re-issue a tool call "
     "(same tool + same effective arguments/scope) whose result is already in your "
     "context or notes when nothing relevant changed in between - including read-only "
@@ -1226,9 +1231,22 @@ def handle_generate(req_id, arguments, meta):
                 subtask_rows = get_subtasks(cursor, int(thread_id))
                 if subtask_rows:
                     lines = [f"## Subtasks (Thread #{thread_id})"]
+                    lines.append(
+                        "These rows are the thread's plan/execution subtasks, listed in "
+                        "creation order. Each row is addressable by its id: update it with "
+                        'subtasks__manage_subtasks(action="update", subtask_id=<id>, '
+                        'status="processing"|"completed"|"cancelled"). Reuse these rows - '
+                        "do NOT create a duplicate set; only add a row for a step discovered mid-run."
+                    )
                     for i, s in enumerate(subtask_rows):
-                        icon = {"completed": "✅", "cancelled": "❌", "error": "⚠️"}.get(s[2], "⬜")
-                        lines.append(f"{i + 1}. {icon} {s[1]}")
+                        icon = {
+                            "completed": "✅",
+                            "cancelled": "❌",
+                            "processing": "🔄",
+                            "in_progress": "🔄",
+                            "error": "⚠️",
+                        }.get(s[2], "⬜")
+                        lines.append(f"{i + 1}. [#{s[0]}] {icon} {s[1]}")
                     context_blocks.append("\n".join(lines))
             except Exception as e:
                 log.warning("Failed to get subtasks: %s", e)
