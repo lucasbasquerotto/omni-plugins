@@ -42,6 +42,8 @@ function check(name, cond, detail) {
 const stubRequests = [];
 let hangMode = false;
 let slowMs = 1800; // /slow delays its response by this much (no-timeout gates)
+const slowHeadersMs = 3000; // /slowheaders delays its response HEADERS by this much
+const slowBodyMs = 2000; // /slowbody sends headers at once, the body after this much
 let stubAborted = false; // a client tore an in-flight request down (timeout/cancel)
 
 function startStub() {
@@ -84,6 +86,38 @@ function startStub() {
               /* the client is gone (timeout/cancel) */
             }
           }, slowMs);
+          return;
+        }
+        if (req.url === "/slowheaders") {
+          // headers only after slowHeadersMs: proves the headers clock
+          setTimeout(() => {
+            try {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: true, slowheaders: true }));
+            } catch (e) {
+              /* the client is gone (timeout/cancel) */
+            }
+          }, slowHeadersMs);
+          return;
+        }
+        if (req.url === "/slowbody") {
+          // headers at once, then the body only after slowBodyMs: proves the
+          // body clock (inactivity) independently of the headers clock.
+          // flushHeaders() is required: writeHead() alone buffers the headers
+          // until the first body write.
+          try {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.flushHeaders();
+          } catch (e) {
+            return;
+          }
+          setTimeout(() => {
+            try {
+              res.end(JSON.stringify({ ok: true, slowbody: true }));
+            } catch (e) {
+              /* the client is gone (timeout/cancel) */
+            }
+          }, slowBodyMs);
           return;
         }
         if (req.url === "/badjson") {
@@ -307,6 +341,59 @@ async function main() {
     `elapsed=${noTimeoutElapsed}ms text=${JSON.stringify(noTimeoutCall.content[0].text).slice(0, 120)}`
   );
   clientNoTimeout.stop();
+
+  // Gate 4c-5: the hidden undici 300 s clocks are gone. `headers_timeout_secs`
+  // is the only headers clock and `0` disables it. A server that delays
+  // response HEADERS longer than the configured cap must abort at the cap; with
+  // the cap disabled the SAME call must complete (regression for the ~300 s
+  // transport fetch cap). Bounded: 3 s server delay vs a 1 s cap.
+  await client.call("configure", {
+    base_url: base,
+    tool_path: "/slowheaders",
+    timeout_secs: 0,
+    headers_timeout_secs: 1,
+    body_timeout_secs: 0,
+  });
+  const headerCapStart = Date.now();
+  const headerCapKilled = await client.call("tools/call", { name: "tool", arguments: { tool: "hello_world", params: {} } });
+  const headerCapElapsed = Date.now() - headerCapStart;
+  check(
+    "headers_timeout_secs=1 -> 3s delayed-headers call aborted at the configured cap",
+    headerCapKilled.isError === true && /headers timeout/i.test(headerCapKilled.content[0].text) && headerCapElapsed >= 900 && headerCapElapsed < 2500,
+    `elapsed=${headerCapElapsed}ms text=${JSON.stringify(headerCapKilled.content[0].text).slice(0, 160)}`
+  );
+
+  await client.call("configure", {
+    tool_path: "/slowheaders",
+    timeout_secs: 0,
+    headers_timeout_secs: 0,
+    body_timeout_secs: 0,
+  });
+  const headerNoCapStart = Date.now();
+  const headerNoCapOk = await client.call("tools/call", { name: "tool", arguments: { tool: "hello_world", params: {} } });
+  const headerNoCapElapsed = Date.now() - headerNoCapStart;
+  check(
+    "headers_timeout_secs=0 -> same 3s delayed-headers call completes (no self-abort)",
+    !headerNoCapOk.isError && headerNoCapElapsed >= slowHeadersMs,
+    `elapsed=${headerNoCapElapsed}ms text=${JSON.stringify(headerNoCapOk.content[0].text).slice(0, 120)}`
+  );
+
+  // The body clock is independent of the headers clock: headers arrive at
+  // once, the body stalls. body_timeout_secs=1 must abort at the cap.
+  await client.call("configure", {
+    tool_path: "/slowbody",
+    timeout_secs: 0,
+    headers_timeout_secs: 0,
+    body_timeout_secs: 1,
+  });
+  const bodyCapStart = Date.now();
+  const bodyCapKilled = await client.call("tools/call", { name: "tool", arguments: { tool: "hello_world", params: {} } });
+  const bodyCapElapsed = Date.now() - bodyCapStart;
+  check(
+    "body_timeout_secs=1 -> 2s stalled body aborted at the configured cap",
+    bodyCapKilled.isError === true && /body timeout/i.test(bodyCapKilled.content[0].text) && bodyCapElapsed >= 900 && bodyCapElapsed < 2500,
+    `elapsed=${bodyCapElapsed}ms text=${JSON.stringify(bodyCapKilled.content[0].text).slice(0, 160)}`
+  );
 
   // Gate 4c-4: `notifications/cancelled` tears the in-flight HTTP request down
   // for real (this is the path core__cancel_task drives): the stub must observe

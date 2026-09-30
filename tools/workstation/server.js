@@ -16,16 +16,28 @@
  *
  * Config (config_schema in plugin.json, delivered as a `configure` JSON-RPC
  * request and/or as environment variables):
- *   base_url     default http://workstation:8080
- *   tool_path    default /api/tool/call
- *   timeout_secs default 60
- *   auth_header  optional Authorization header value (empty = header omitted)
+ *   base_url             default http://workstation:8080
+ *   tool_path            default /api/tool/call
+ *   timeout_secs         default 0 (0 = NO timeout; positive = operator opt-in)
+ *   headers_timeout_secs default 900 (seconds to wait for the response headers;
+ *                        0 = disabled, no clock at all)
+ *   body_timeout_secs    default 900 (seconds of response-body inactivity
+ *                        before the request is aborted; 0 = disabled)
+ *   auth_header          optional Authorization header value (empty = omitted)
  *
- * Runtime: Node >= 18 (global `fetch` + `AbortController`), no npm deps.
+ * Runtime: Node >= 18, stdio JSON-RPC, **no npm deps**. The HTTP forward is a
+ * plain node:http / node:https POST, NOT Node's global `fetch`. Global fetch is
+ * undici, whose hidden `headersTimeout` / `bodyTimeout` default to 300 s and
+ * abort a long workstation run client-side even when `timeout_secs` is 0 (the
+ * server keeps working, the response is lost). This request has no hidden
+ * clock: the only bounds are the two `*_timeout_secs` knobs above (0 =
+ * disabled) plus the AbortController the caller passes.
  */
 
 const readline = require("readline");
 const process = require("process");
+const http = require("http");
+const https = require("https");
 
 const MCP_PROTOCOL_VERSION = "2025-03-26";
 const SERVER_NAME = "workstation";
@@ -44,6 +56,13 @@ const DEFAULT_TOOL_PATH = "/api/tool/call";
 //   positive integer   -> explicit operator opt-in timeout in seconds.
 const NO_TIMEOUT_SECS = 0;
 const DEFAULT_TIMEOUT_SECS = NO_TIMEOUT_SECS;
+
+// Explicit HTTP clocks replacing undici's hidden 300 s defaults. 0 = disabled
+// (the request waits until the server answers, the connection fails, or the
+// client aborts). 900 s covers real worker runs while still bounding a dead
+// connection; raise or disable per deployment.
+const DEFAULT_HEADERS_TIMEOUT_SECS = 900;
+const DEFAULT_BODY_TIMEOUT_SECS = 900;
 
 // The single declared tool name. `tool_qualify("workstation", "tool")` in core
 // turns it into the exposed name `workstation__tool`.
@@ -93,6 +112,11 @@ function describeTimeout() {
   return config.timeout_secs > 0 ? String(config.timeout_secs) : "none";
 }
 
+/** Human-readable HTTP clock for the logs: "none" when the clock is disabled. */
+function describeClock(secs) {
+  return secs > 0 ? String(secs) : "none";
+}
+
 const config = {
   base_url: pickString(
     [process.env.base_url, process.env.BASE_URL, process.env.WORKSTATION_BASE_URL],
@@ -109,6 +133,22 @@ const config = {
       process.env.WORKSTATION_TIMEOUT_SECS,
     ],
     DEFAULT_TIMEOUT_SECS
+  ),
+  headers_timeout_secs: pickTimeoutSecs(
+    [
+      process.env.headers_timeout_secs,
+      process.env.HEADERS_TIMEOUT_SECS,
+      process.env.WORKSTATION_HEADERS_TIMEOUT_SECS,
+    ],
+    DEFAULT_HEADERS_TIMEOUT_SECS
+  ),
+  body_timeout_secs: pickTimeoutSecs(
+    [
+      process.env.body_timeout_secs,
+      process.env.BODY_TIMEOUT_SECS,
+      process.env.WORKSTATION_BODY_TIMEOUT_SECS,
+    ],
+    DEFAULT_BODY_TIMEOUT_SECS
   ),
   auth_header: pickString(
     [
@@ -132,6 +172,16 @@ function applyConfig(payload) {
       [payload.timeout_secs],
       config.timeout_secs
     );
+  if (payload.headers_timeout_secs !== undefined)
+    config.headers_timeout_secs = pickTimeoutSecs(
+      [payload.headers_timeout_secs],
+      config.headers_timeout_secs
+    );
+  if (payload.body_timeout_secs !== undefined)
+    config.body_timeout_secs = pickTimeoutSecs(
+      [payload.body_timeout_secs],
+      config.body_timeout_secs
+    );
   if (payload.auth_header !== undefined)
     config.auth_header = pickString([payload.auth_header], "");
   console.error(
@@ -141,6 +191,10 @@ function applyConfig(payload) {
       config.tool_path +
       " timeout_secs=" +
       describeTimeout() +
+      " headers_timeout_secs=" +
+      describeClock(config.headers_timeout_secs) +
+      " body_timeout_secs=" +
+      describeClock(config.body_timeout_secs) +
       " auth_header=" +
       (config.auth_header ? "<set>" : "<none>")
   );
@@ -223,6 +277,151 @@ function targetUrl() {
   return base + (path.startsWith("/") ? path : "/" + path);
 }
 
+// ── HTTP forwarding ────────────────────────────────────────────────────────
+//
+// Plain node:http / node:https POST. Node's global fetch is undici, which
+// enforces a hidden 300 s headersTimeout/bodyTimeout independent of the
+// plugin's own `timeout_secs` AbortController; a long workstation run (the
+// server answers only when the worker finishes) was aborted client-side at
+// exactly 300 s even with `timeout_secs: 0`. This request has NO hidden clock:
+// the only bounds are `headers_timeout_secs` / `body_timeout_secs` (0 =
+// disabled) plus the AbortController the caller passes.
+//
+// Resolves with a fetch-like response object `{ status, statusText, ok, text() }`
+// as soon as the response headers arrive; `text()` resolves with the full body
+// (or rejects on a body error / body-timeout / client cancel).
+
+function requestWorkstation(url, headers, bodyText, signal) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const headersTimeoutSecs = config.headers_timeout_secs;
+    const bodyTimeoutSecs = config.body_timeout_secs;
+    const lib = parsed.protocol === "https:" ? https : http;
+
+    let headersTimer = null;
+    let bodyTimer = null;
+    let responseStarted = false;
+    let bodyFinished = false;
+    let bodyResolve = null;
+    let bodyReject = null;
+    const bodyPromise = new Promise((res, rej) => {
+      bodyResolve = res;
+      bodyReject = rej;
+    });
+    // The caller only awaits bodyPromise once a response exists; if the
+    // request dies before that, do not surface an unhandled rejection.
+    bodyPromise.catch(function () {});
+
+    function clearHeadersTimer() {
+      if (headersTimer) {
+        clearTimeout(headersTimer);
+        headersTimer = null;
+      }
+    }
+
+    function clearBodyTimer() {
+      if (bodyTimer) {
+        clearTimeout(bodyTimer);
+        bodyTimer = null;
+      }
+    }
+
+    function finishBody(err, text) {
+      if (bodyFinished) return;
+      bodyFinished = true;
+      clearBodyTimer();
+      if (err) bodyReject(err);
+      else bodyResolve(text);
+    }
+
+    function armBodyTimer(res) {
+      if (bodyTimeoutSecs <= 0) return; // clock disabled
+      clearBodyTimer();
+      bodyTimer = setTimeout(function () {
+        const err = new Error(
+          "body timeout after " + bodyTimeoutSecs + "s (body_timeout_secs)"
+        );
+        err.name = "BodyTimeoutError";
+        res.destroy(err);
+        req.destroy(err);
+      }, bodyTimeoutSecs * 1000);
+    }
+
+    const req = lib.request(
+      {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port || undefined,
+        path: parsed.pathname + parsed.search,
+        method: "POST",
+        headers: headers,
+      },
+      function (res) {
+        responseStarted = true;
+        clearHeadersTimer();
+        armBodyTimer(res);
+        const chunks = [];
+        res.on("data", function (chunk) {
+          chunks.push(chunk);
+          armBodyTimer(res);
+        });
+        res.on("end", function () {
+          finishBody(null, Buffer.concat(chunks).toString("utf8"));
+        });
+        res.on("error", function (err) {
+          finishBody(err);
+        });
+        resolve({
+          status: res.statusCode,
+          statusText: res.statusMessage || "",
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          text: function () {
+            return bodyPromise;
+          },
+        });
+      }
+    );
+
+    req.on("error", function (err) {
+      clearHeadersTimer();
+      if (!responseStarted) {
+        reject(err);
+        return;
+      }
+      finishBody(err);
+    });
+
+    function onAbort() {
+      const err = new Error("The operation was aborted");
+      err.name = "AbortError";
+      req.destroy(err);
+    }
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    if (headersTimeoutSecs > 0) {
+      headersTimer = setTimeout(function () {
+        const err = new Error(
+          "headers timeout after " + headersTimeoutSecs + "s (headers_timeout_secs)"
+        );
+        err.name = "HeadersTimeoutError";
+        req.destroy(err);
+      }, headersTimeoutSecs * 1000);
+    }
+
+    req.end(bodyText);
+  });
+}
+
 // In-flight tools/call requests: JSON-RPC request id -> AbortController, so a
 // `notifications/cancelled` from the client tears the HTTP request down for
 // real (core__cancel_task must abort the in-flight call, not just flag it).
@@ -250,12 +449,7 @@ async function callWorkstation(toolName, params, controller) {
 
   let response;
   try {
-    response = await fetch(url, {
-      method: "POST",
-      headers,
-      body,
-      signal: abort.signal,
-    });
+    response = await requestWorkstation(url, headers, body, abort.signal);
   } catch (err) {
     if (timer) clearTimeout(timer);
     const aborted = err && err.name === "AbortError";
@@ -376,6 +570,10 @@ function applyConfigFromEnvSummary() {
       config.tool_path +
       " timeout_secs=" +
       describeTimeout() +
+      " headers_timeout_secs=" +
+      describeClock(config.headers_timeout_secs) +
+      " body_timeout_secs=" +
+      describeClock(config.body_timeout_secs) +
       " auth_header=" +
       (config.auth_header ? "<set>" : "<none>")
   );

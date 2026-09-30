@@ -26,6 +26,20 @@
       "description": "HTTP timeout in seconds for one workstation call (AbortController); a timeout returns a clear isError result, never a hang."
     },
     {
+      "key": "headers_timeout_secs",
+      "label": "Headers Timeout (s)",
+      "type": "integer",
+      "default": 900,
+      "description": "Seconds to wait for the response headers before aborting the HTTP request (the workstation answers only when a worker run finishes, so this must cover the whole run). 0 = disabled (no clock). Default 900, raised from Node's hidden 300 s undici headersTimeout."
+    },
+    {
+      "key": "body_timeout_secs",
+      "label": "Body Timeout (s)",
+      "type": "integer",
+      "default": 900,
+      "description": "Seconds of response-body inactivity before the HTTP request is aborted. 0 = disabled (no clock). Default 900, raised from Node's hidden 300 s undici bodyTimeout."
+    },
+    {
       "key": "auth_header",
       "label": "Authorization Header",
       "type": "string",

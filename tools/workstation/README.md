@@ -83,6 +83,8 @@ parallel `workstation__tool` calls run in flight together.
 | `base_url` | string | `http://workstation:8080` | workstation HTTP API base URL |
 | `tool_path` | string | `/api/tool/call` | path appended to `base_url` |
 | `timeout_secs` | integer | `60` | HTTP timeout per call |
+| `headers_timeout_secs` | integer | `900` | seconds to wait for the response headers; `0` = disabled (no clock) |
+| `body_timeout_secs` | integer | `900` | seconds of response-body inactivity before abort; `0` = disabled (no clock) |
 | `auth_header` | string | `""` | optional `Authorization` header value (e.g. `Bearer $secret:WORKSTATION_TOKEN`) |
 
 Values reach the plugin through the `configure` JSON-RPC request and/or as
@@ -91,8 +93,15 @@ references use `$env:VAR` / `$secret:NAME` (never a literal `${VAR}`).
 
 ## Runtime
 
-Node >= 18 (global `fetch` + `AbortController`), stdio JSON-RPC like
+Node >= 18 (`node:http` / `node:https` + `AbortController`), stdio JSON-RPC like
 `tools/test-js-tool/server.js`. **No npm dependencies.**
+
+The forward is deliberately **not** Node's global `fetch`: global fetch is
+undici, whose hidden `headersTimeout` / `bodyTimeout` default to 300 s and abort
+a long workstation run client-side even when `timeout_secs` is 0 (the server
+keeps working, the response is lost). The request has no hidden clock: the only
+bounds are `headers_timeout_secs` / `body_timeout_secs` (0 = disabled) and the
+caller's `AbortController` (`timeout_secs` / `notifications/cancelled`).
 
 ## Test harness
 
