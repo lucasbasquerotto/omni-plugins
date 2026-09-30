@@ -17,6 +17,7 @@
 "use strict";
 
 const http = require("http");
+const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 
@@ -169,6 +170,22 @@ async function expectRpcError(promise, code, label) {
 // ── scenarios ──────────────────────────────────────────────────────────────
 
 async function main() {
+  // Regression guard (2026-09-30, omnidev verify workstation background dispatch):
+  // the MCP CLIENT config must NOT declare a hard timeout_secs. The omniagent
+  // core wraps long-running tools in tokio::time::timeout(timeout_secs), so a
+  // value here would kill jobs longer than it with "exceeded long timeout" -
+  // against the rule that cancellation happens ONLY on job/thread cancel. The
+  // absent field deserializes to None = no timeout.
+  const mcpConfig = JSON.parse(
+    fs.readFileSync(path.join(PLUGIN_DIR, "mcp-config.json"), "utf8")
+  );
+  const serverCfg = (mcpConfig.servers || [])[0] || {};
+  check(
+    "mcp-config.json declares NO timeout_secs (no hard clock on long runs)",
+    serverCfg.timeout_secs === undefined,
+    "timeout_secs=" + JSON.stringify(serverCfg.timeout_secs)
+  );
+
   const stub = await startStub();
   const port = stub.address().port;
   const base = `http://127.0.0.1:${port}`;

@@ -6,7 +6,6 @@
       "command": "nodejs",
       "args": ["server.js"],
       "env": {},
-      "timeout_secs": 900,
       "max_retries": 1,
       "allowed_tools": ["*"]
     }
