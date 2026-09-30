@@ -1936,7 +1936,16 @@ def handle_compact_messages(req_id, arguments):
         # error: 279/24h on 2026-09-20).
         billed_prompt_tokens = int(args.get("billed_prompt_tokens") or 0)
         measured_tokens = int(args.get("measured_tokens") or 0)
-        over_billed = billed_prompt_tokens > hard_budget
+        # A billing baseline exists when the core paired a provider-billed prompt
+        # token count with the plugin's measured size of the SAME request. The
+        # difference is the invisible overhead (tool schemas, chat template, the
+        # provider's own tokenizer, cached-token accounting) that the plugin's
+        # message-only measure cannot see. It is applied to the gate AND targets
+        # whenever a baseline exists - NOT only after an overshoot - so compaction
+        # fires BEFORE the provider bills over the hard budget (chronic 279/24h
+        # "condensation did not reduce it" fired once per growth span because the
+        # gate compared the raw measured size against the hard budget while the
+        # provider billed measured + overhead).
         if measured_tokens > 0 and billed_prompt_tokens > measured_tokens:
             # Clamp: a provider number can be a cumulative/aggregate total, and
             # tokenizers differ; never let the derived overhead drive the
@@ -1944,27 +1953,35 @@ def handle_compact_messages(req_id, arguments):
             overhead = min(billed_prompt_tokens - measured_tokens, hard_budget // 2)
         else:
             overhead = 0
-        headroom = cfg.get("compact_headroom_tokens", 2000) if over_billed else 0
+        # Headroom absorbs tokenizer drift and the per-iteration system injections
+        # the compaction gate cannot measure; applied whenever a billing baseline
+        # exists (the estimate comes from the PREVIOUS request, the next one drifts).
+        headroom = cfg.get("compact_headroom_tokens", 2000) if overhead > 0 else 0
         # Size our own measure must reach so the provider bills under the hard
         # budget. Never above the hard budget; the soft budget stays the stricter
         # reduction target whenever it already sits below it.
         hard_target = max(0, hard_budget - overhead - headroom)
-        # The size the provider needs: while it bills OVER the hard budget the
-        # unmeasurable overhead has to come out of our own measure as well.
-        must_fit_target = hard_target if over_billed else hard_budget
+        # The size the provider needs: whenever a billing baseline exists, the
+        # unmeasurable overhead has to come out of our own measure as well -
+        # otherwise the provider bills over while the plugin still sees "under".
+        must_fit_target = hard_target if overhead > 0 else hard_budget
         # Progressive-drain target: the soft budget (the historical reduction
-        # target), tightened to hard_target while the provider is overshooting.
-        reduce_target = min(soft_budget, hard_target) if over_billed else soft_budget
+        # target), tightened to hard_target whenever a billing baseline exists.
+        reduce_target = min(soft_budget, hard_target) if overhead > 0 else soft_budget
         # Truncation-fallback target: the drain target, but NEVER above what fits
         # under the hard budget (a soft budget configured above the hard budget
         # must not disable the reduction).
         effective_target = min(reduce_target, must_fit_target)
-        # Threshold gate: compact ONLY when the HARD budget is exceeded (or the
-        # core forces it because the provider billed over the hard budget). The
-        # SOFT budget is the REDUCTION TARGET consumed below, never a trigger: a
-        # prompt whose size sits between soft and hard stays completely UNTOUCHED
-        # (no draining, no truncation, null-contract).
-        if force_compact or current_size > hard_budget:
+        # Threshold gate: compact ONLY when the provider-fit HARD budget is
+        # exceeded (or the core forces it because the provider billed over the
+        # hard budget). With a billing baseline the gate is hard_budget -
+        # overhead (- headroom): the provider bills measured + overhead, so the
+        # raw measured size must sit BELOW the hard budget by the known overhead
+        # or the provider bills over and the overshoot error fires (chronic
+        # 279/24h). The SOFT budget is the REDUCTION TARGET consumed below, never
+        # a trigger: a prompt whose size sits between soft and hard stays
+        # completely UNTOUCHED (no draining, no truncation, null-contract).
+        if force_compact or current_size > must_fit_target:
             settings = {
                 "read_only_tools": read_only_tool_names(args),
                 "tool_excerpt_chars": cfg.get("tool_excerpt_chars", 800),
