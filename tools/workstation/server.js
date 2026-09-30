@@ -19,9 +19,9 @@
  *   base_url             default http://workstation:8080
  *   tool_path            default /api/tool/call
  *   timeout_secs         default 0 (0 = NO timeout; positive = operator opt-in)
- *   headers_timeout_secs default 900 (seconds to wait for the response headers;
+ *   headers_timeout_secs default 0 (seconds to wait for the response headers;
  *                        0 = disabled, no clock at all)
- *   body_timeout_secs    default 900 (seconds of response-body inactivity
+ *   body_timeout_secs    default 0 (seconds of response-body inactivity
  *                        before the request is aborted; 0 = disabled)
  *   auth_header          optional Authorization header value (empty = omitted)
  *
@@ -59,10 +59,11 @@ const DEFAULT_TIMEOUT_SECS = NO_TIMEOUT_SECS;
 
 // Explicit HTTP clocks replacing undici's hidden 300 s defaults. 0 = disabled
 // (the request waits until the server answers, the connection fails, or the
-// client aborts). 900 s covers real worker runs while still bounding a dead
-// connection; raise or disable per deployment.
-const DEFAULT_HEADERS_TIMEOUT_SECS = 900;
-const DEFAULT_BODY_TIMEOUT_SECS = 900;
+// client aborts). Operator requirement (2026-09-30): NO timeout at all — the
+// agent manages long runs via core__wait_task / core__cancel_task only.
+// Positive values are an explicit operator opt-in per deployment.
+const DEFAULT_HEADERS_TIMEOUT_SECS = 0;
+const DEFAULT_BODY_TIMEOUT_SECS = 0;
 
 // The single declared tool name. `tool_qualify("workstation", "tool")` in core
 // turns it into the exposed name `workstation__tool`.

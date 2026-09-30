@@ -22,22 +22,22 @@
       "key": "timeout_secs",
       "label": "HTTP Timeout (s)",
       "type": "integer",
-      "default": 60,
-      "description": "HTTP timeout in seconds for one workstation call (AbortController); a timeout returns a clear isError result, never a hang."
+      "default": 0,
+      "description": "HTTP timeout in seconds for one workstation call (AbortController); a timeout returns a clear isError result, never a hang. 0 = NO timeout (default): the request ends when the workstation answers, the connection fails, or the client cancels it."
     },
     {
       "key": "headers_timeout_secs",
       "label": "Headers Timeout (s)",
       "type": "integer",
-      "default": 900,
-      "description": "Seconds to wait for the response headers before aborting the HTTP request (the workstation answers only when a worker run finishes, so this must cover the whole run). 0 = disabled (no clock). Default 900, raised from Node's hidden 300 s undici headersTimeout."
+      "default": 0,
+      "description": "Seconds to wait for the response headers before aborting the HTTP request (the workstation answers only when a worker run finishes, so this must cover the whole run). 0 = disabled (no clock). Default 0 = no timeout at all; positive is an explicit operator opt-in."
     },
     {
       "key": "body_timeout_secs",
       "label": "Body Timeout (s)",
       "type": "integer",
-      "default": 900,
-      "description": "Seconds of response-body inactivity before the HTTP request is aborted. 0 = disabled (no clock). Default 900, raised from Node's hidden 300 s undici bodyTimeout."
+      "default": 0,
+      "description": "Seconds of response-body inactivity before the HTTP request is aborted. 0 = disabled (no clock). Default 0 = no timeout at all; positive is an explicit operator opt-in."
     },
     {
       "key": "auth_header",
