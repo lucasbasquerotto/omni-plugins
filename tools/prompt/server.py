@@ -475,16 +475,71 @@ def get_db():
     return conn
 
 
+# ---------------------------------------------------------------------------
+# Conversation history selection (2026-10-01, task: omni profile "main" loses
+# operator statements 2-3 turns later).
+#
+# The OPERATOR-VISIBLE turns of a thread are:
+#   role 'cause'      = the operator prompt that opened the thread
+#   role 'sub_cause'  = an operator prompt merged into a RUNNING thread
+#   msg_type 'summary'= the agent's final answer (what the operator reads)
+#   msg_type 'message'/'reasoning' = intermediate agent text (legacy + live)
+# Everything else is TOOL TRAFFIC ('tool', 'tool-result', 'multi-tool'), the
+# prompt dump ('prompt') or the internal plan ('plan') and must NOT be
+# selected: it would swamp the window with machine output.
+#
+# The previous filter `role = 'cause' OR msg_type IN ('message','reasoning')`
+# matched the cause plus ONE reasoning blob in a 73-message thread (thread
+# 3745), so the agent could not see ANY of its own previous answers or the
+# operator prompts merged into the thread: the rendered prompt carried a
+# 2-line "conversation" for a 73-message conversation.
+CONVERSATION_MSG_TYPES = ("message", "reasoning", "summary")
+CONVERSATION_ROLES = ("cause", "sub_cause")
+# Per-message cap and total cap for the rendered history block. The newest
+# turns are kept first; older ones are dropped when the total cap is reached.
+CONVERSATION_MESSAGE_MAX_CHARS = 1200
+CONVERSATION_HISTORY_MAX_CHARS = 8000
+# Verbatim operator messages of the most recent OTHER threads of the channel.
+# A new operator message normally starts a NEW thread (the previous one is
+# terminal), so the current thread's own history holds only the new message;
+# without this block the operator's earlier words reach the agent only through
+# the lossy, agent-generated channel summary.
+CHANNEL_OPERATOR_MESSAGES_LIMIT = 5
+CHANNEL_OPERATOR_MESSAGE_MAX_CHARS = 1200
+
+
 def get_thread_messages(cursor, thread_id, limit=10):
     cursor.execute(
         """SELECT id, thread_id, role, content, msg_type, msg_subtype,
                   COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), '') AS created_at
            FROM messages
            WHERE thread_id = %s
-             AND (role = 'cause' OR msg_type IN ('message', 'reasoning'))
+             AND (role IN ('cause', 'sub_cause')
+                  OR msg_type IN ('message', 'reasoning', 'summary'))
            ORDER BY created_at DESC
            LIMIT %s""",
         (thread_id, limit),
+    )
+    rows = cursor.fetchall()
+    rows.reverse()  # oldest first
+    return rows
+
+
+def get_recent_channel_operator_messages(cursor, channel_id, before_thread_id, limit=5):
+    """Verbatim operator prompts from the most recent OTHER threads of the
+    same channel (newest last). Purely additive context: it lets a follow-up
+    thread answer from the operator's ACTUAL words instead of the paraphrased
+    channel summary."""
+    cursor.execute(
+        """SELECT t.id, m.content
+           FROM messages m
+           JOIN threads t ON t.id = m.thread_id
+           WHERE t.channel_id = %s
+             AND m.role = 'cause'
+             AND t.id < %s
+           ORDER BY m.id DESC
+           LIMIT %s""",
+        (str(channel_id), int(before_thread_id), limit),
     )
     rows = cursor.fetchall()
     rows.reverse()  # oldest first
@@ -1169,15 +1224,28 @@ def handle_generate(req_id, arguments, meta):
         db = get_db()
         cursor = db.cursor()
 
-        # 2a. Recent thread messages
+        # 2a. Recent thread messages (the thread's own conversational turns)
         if thread_id is not None:
             try:
                 tid = int(thread_id)
                 msgs = get_thread_messages(cursor, tid, 10)
                 if msgs:
-                    formatted = [f"[{m[2]}]: {truncate_str(m[3], 400)}" for m in msgs]
+                    # Newest turns first while the total budget lasts: the turns
+                    # an operator follow-up refers to ("I said 2 messages ago")
+                    # are the recent ones, never the beginning of the thread.
+                    remaining = CONVERSATION_HISTORY_MAX_CHARS
+                    formatted = []
+                    for m in reversed(msgs):
+                        text = truncate_str(m[3], CONVERSATION_MESSAGE_MAX_CHARS)
+                        if formatted and len(text) > remaining:
+                            break
+                        formatted.append(f"[{m[2]}]: {text}")
+                        remaining -= len(text)
+                    formatted.reverse()
                     context_blocks.append(
-                        "Recent conversation history (current thread):\n" + "\n".join(formatted)
+                        "Recent conversation history (current thread, oldest first; "
+                        "each entry is one operator-visible turn):\n"
+                        + "\n".join(formatted)
                     )
             except Exception as e:
                 log.warning("Failed to get thread messages: %s", e)
@@ -1225,6 +1293,30 @@ def handle_generate(req_id, arguments, meta):
         except Exception as e:
             log.warning("Learned knowledge context unavailable: %s", e)
 
+        # 2b-2. Verbatim operator prompts from the most recent other threads
+        # of this channel. Operator statements made 2-3 messages ago normally
+        # live in a PREVIOUS thread (each operator message opens its own
+        # thread once the previous one is terminal); without this block they
+        # reach the agent only as the lossy channel summary paraphrase.
+        if channel_id is not None and thread_id is not None:
+            try:
+                ops = get_recent_channel_operator_messages(
+                    cursor, channel_id, int(thread_id), CHANNEL_OPERATOR_MESSAGES_LIMIT
+                )
+                if ops:
+                    lines = [
+                        f"[Thread #{r[0]} operator]: "
+                        f"{truncate_str(r[1], CHANNEL_OPERATOR_MESSAGE_MAX_CHARS)}"
+                        for r in ops
+                    ]
+                    context_blocks.append(
+                        "Recent operator messages in this channel (VERBATIM operator "
+                        "words, threads just before this one, newest last; when they "
+                        "disagree with the channel summary above, THESE win):\n"
+                        + "\n".join(lines)
+                    )
+            except Exception as e:
+                log.warning("Failed to get channel operator messages: %s", e)
         # 2d. Subtasks
         if thread_id is not None:
             try:
