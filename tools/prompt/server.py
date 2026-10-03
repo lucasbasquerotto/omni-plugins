@@ -2048,7 +2048,25 @@ def handle_compact_messages(req_id, arguments):
         # Headroom absorbs tokenizer drift and the per-iteration system injections
         # the compaction gate cannot measure; applied whenever a billing baseline
         # exists (the estimate comes from the PREVIOUS request, the next one drifts).
-        headroom = cfg.get("compact_headroom_tokens", 2000) if overhead > 0 else 0
+        # Observed provider overshoot of the PREVIOUS request (mirror Rust
+        # main.rs, thread 3998): the provider billed MORE than this plugin's
+        # target allowed by adding tokens after our measure. The billed/measured
+        # pair is inherently one request old, so the excess is exactly how much
+        # the overhead estimate was short - carrying it into the headroom makes
+        # the NEXT reduction account for it instead of repeating the overshoot.
+        # One-directional: it can only TIGHTEN the internal reduction target,
+        # never relax an operator-configured budget.
+        observed_overshoot = int(args.get("observed_overshoot_tokens") or 0)
+        headroom = (
+            (cfg.get("compact_headroom_tokens", 2000) if overhead > 0 else 0)
+            + observed_overshoot
+        )
+        if observed_overshoot > 0:
+            log.info(
+                "[prompt] observed provider overshoot %s tokens fed back: "
+                "reduction target tightened to fit the hard budget",
+                observed_overshoot,
+            )
         # Size our own measure must reach so the provider bills under the hard
         # budget. Never above the hard budget; the soft budget stays the stricter
         # reduction target whenever it already sits below it.
@@ -2056,7 +2074,9 @@ def handle_compact_messages(req_id, arguments):
         # The size the provider needs: whenever a billing baseline exists, the
         # unmeasurable overhead has to come out of our own measure as well -
         # otherwise the provider bills over while the plugin still sees "under".
-        must_fit_target = hard_target if overhead > 0 else hard_budget
+        must_fit_target = (
+            hard_target if (overhead > 0 or observed_overshoot > 0) else hard_budget
+        )
         # Progressive-drain target: the soft budget (the historical reduction
         # target), tightened to hard_target whenever a billing baseline exists.
         reduce_target = min(soft_budget, hard_target) if overhead > 0 else soft_budget
@@ -2139,6 +2159,7 @@ def handle_compact_messages(req_id, arguments):
             "before_count": before,
             "after_count": after,
             "measured_tokens": after_size,
+            "observed_overshoot_tokens": observed_overshoot,
             "effective_target": effective_target,
             "truncate_target": must_fit_target,
             "over_budget": still_over,

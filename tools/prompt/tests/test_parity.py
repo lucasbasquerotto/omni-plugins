@@ -496,7 +496,8 @@ class CompactMessagesE2E(unittest.TestCase):
         self.assertEqual(
             sorted(envelope), ["after_count", "before_count", "dump_file",
                                "effective_target", "entries", "iteration",
-                               "measured_tokens", "messages", "over_budget",
+                               "measured_tokens", "messages",
+                               "observed_overshoot_tokens", "over_budget",
                                "truncate_target", "truncated_chars",
                                "was_compacted"])
 
@@ -675,6 +676,63 @@ class ProviderBillingAlignment(unittest.TestCase):
         self.assertTrue(all(m.get("tool_call_id")
                             for m in out if m.get("role") == "tool"), text)
 
+
+    def test_observed_overshoot_feedback_tightens_the_gate(self):
+        """Thread 3998 (thread 3978's 201637-token call): the core feeds the
+        observed provider overshoot back, so a prompt this plugin measured as
+        fitting IS reduced once the previous request proved the estimate was
+        short. Without the feedback the gate stays open and the provider keeps
+        billing over the hard budget - the state that produced the chronic
+        'condensation did not reduce it' error."""
+        messages = [{"role": "system", "content": "SYSTEM PROMPT MUST SURVIVE"}]
+        for _ in range(5):
+            messages.append({
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": "c1", "type": "function",
+                                "function": {"name": "filesystem__read",
+                                             "arguments": "{}"}}],
+            })
+            messages.append({"role": "tool", "name": "filesystem__read",
+                             "tool_call_id": "c1", "content": "X" * 200000})
+        messages.append({"role": "user", "content": "CURRENT USER TURN MUST SURVIVE"})
+        messages.append({"role": "assistant", "content": "working"})
+
+        measured = server.measure_size(messages, "")
+        overhead, headroom, overshoot = 5000, 2000, 2000
+        hard = measured + overhead + headroom + 1000
+        soft = 50000
+        self.assertLess(measured, hard)
+
+        def call(observed):
+            is_error, text = self.session.call_tool("prompt_compact-messages", {
+                "messages": messages,
+                "keep_recent": 3,
+                "soft_budget": soft,
+                "hard_budget": hard,
+                "billed_prompt_tokens": hard + overshoot,
+                "measured_tokens": hard + overshoot - overhead,
+                "observed_overshoot_tokens": observed,
+            })
+            self.assertFalse(is_error, text)
+            return json.loads(text)
+
+        # CONTROL: no feedback -> the gate stays open even though the provider
+        # really billed over the hard budget.
+        control = call(0)
+        self.assertFalse(control["was_compacted"], control)
+        self.assertFalse(control["over_budget"], control)
+        self.assertEqual(control["truncate_target"], measured + 1000, control)
+
+        # WITH the observed overshoot the target is tightened by exactly that
+        # much: the gate fires and the prompt is reduced under the target.
+        envelope = call(overshoot)
+        self.assertEqual(envelope["observed_overshoot_tokens"], overshoot, envelope)
+        self.assertTrue(envelope["was_compacted"], envelope)
+        self.assertFalse(envelope["over_budget"], envelope)
+        self.assertEqual(envelope["truncate_target"], measured - 1000, envelope)
+        self.assertLessEqual(envelope["measured_tokens"],
+                             envelope["truncate_target"])
+        self.assertLess(envelope["after_count"], envelope["before_count"])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
